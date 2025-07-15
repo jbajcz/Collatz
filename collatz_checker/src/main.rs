@@ -14,7 +14,7 @@ const BATCH_SIZE: usize = 100; // Size of batches workers send to admin for chec
 const WORKER_COUNT: usize = 3;
 const SAVE_FILE_NAME: &str = "collatz_state.bin"; // File to save/load state
 const TOTAL_RANGE_SIZE: u128 = 10000; // Total numbers to check in a single run, starting from min_found
-const ADMIN_ADD_BATCH_THRESHOLD: usize = 1000; // Admin accumulates this many values before adding to main_array
+const ADMIN_ADD_BATCH_THRESHOLD: usize = 2000; // Admin accumulates this many values before adding to main_array
 
 #[derive(Debug)]
 struct WorkerBatch {
