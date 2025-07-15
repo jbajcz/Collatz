@@ -2,3 +2,4 @@ target
 *.svg
 *.data
 *.bin
+*.old

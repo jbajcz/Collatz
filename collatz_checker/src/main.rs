@@ -10,15 +10,16 @@ use serde::{Serialize, Deserialize};
 use bincode;
 
 // Configuration constants
-const BATCH_SIZE: usize = 100;
+const BATCH_SIZE: usize = 100; // Size of batches workers send to admin for checking
 const WORKER_COUNT: usize = 3;
 const SAVE_FILE_NAME: &str = "collatz_state.bin"; // File to save/load state
-const TOTAL_RANGE_SIZE: u128 = 2000; // Total numbers to check in a single run, starting from min_found
+const TOTAL_RANGE_SIZE: u128 = 10000; // Total numbers to check in a single run, starting from min_found
+const ADMIN_ADD_BATCH_THRESHOLD: usize = 1000; // Admin accumulates this many values before adding to main_array
 
 #[derive(Debug)]
 struct WorkerBatch {
     values_to_check: Vec<u128>,
-    values_to_add: Vec<u128>,
+    values_to_add: Vec<u128>, // Values to be added to the main array (resolved sequence)
     worker_id: usize,
 }
 
@@ -54,7 +55,9 @@ impl CollatzChecker {
         
         // Initialize with known values (1, 2, 4 loop)
         // These are added to main_array, but min_found is explicitly set to 5 afterwards.
-        checker.add_values(&[1, 2, 4]);
+        // We call the internal _add_values_and_extrapolate directly for initial setup
+        // to avoid triggering the batching logic prematurely.
+        checker._add_values_and_extrapolate(&[1, 2, 4]);
         
         // Explicitly set min_found to the first number we actually need to check as a starting point.
         // All numbers < 5 (i.e., 1,2,3,4) are either handled (1,2,4) or will converge quickly (3 -> 10 -> 5 -> 16 -> ...).
@@ -64,15 +67,15 @@ impl CollatzChecker {
         checker
     }
     
-    // This function now handles adding values to the main_array, updating max_stored,
-    // and performing the powers-of-2 extrapolation in a single, more efficient pass.
-    fn add_values(&mut self, values: &[u128]) {
+    // Internal helper function to perform the actual adding, extrapolation, sorting, and purging.
+    // This is called by the admin when enough values have accumulated.
+    fn _add_values_and_extrapolate(&mut self, values: &[u128]) {
         // Collect all new values (direct and extrapolated) into a temporary vector.
         // Pre-allocate some capacity to reduce reallocations.
-        let mut values_to_add_and_extrapolate = Vec::with_capacity(values.len() * 2);
+        let mut values_to_process = Vec::with_capacity(values.len() * 2); // Heuristic for initial capacity
 
-        // Add the direct values from the worker batch
-        values_to_add_and_extrapolate.extend_from_slice(values);
+        // Add the direct values from the incoming batch
+        values_to_process.extend_from_slice(values);
 
         // Generate extrapolated values (powers of 2) from the incoming direct values.
         // These incoming 'values' are the base candidates because they are newly discovered
@@ -81,8 +84,6 @@ impl CollatzChecker {
             let mut current_extrapolated = base_value;
             loop {
                 // Check for overflow before multiplying by 2.
-                // If `current_extrapolated` is already greater than half of `u128::MAX`,
-                // then `current_extrapolated * 2` would overflow.
                 if current_extrapolated > u128::MAX / 2 {
                     break; // Cannot multiply further without overflow
                 }
@@ -91,7 +92,7 @@ impl CollatzChecker {
                 // Only add extrapolated values that are relevant (>= min_found).
                 // We don't check `contains_value` here, as the final dedup will handle duplicates.
                 if current_extrapolated >= self.min_found {
-                    values_to_add_and_extrapolate.push(current_extrapolated);
+                    values_to_process.push(current_extrapolated);
                 } else {
                     // If the extrapolated value is less than min_found, it would be purged anyway.
                     // Further multiples of 2 will also be less than min_found.
@@ -101,10 +102,9 @@ impl CollatzChecker {
         }
 
         // Extend the main_array with all new and extrapolated values.
-        self.main_array.extend(values_to_add_and_extrapolate);
+        self.main_array.extend(values_to_process);
 
         // Sort and deduplicate the entire main_array once.
-        // This is the primary optimization: one sort/dedup instead of two.
         self.main_array.sort_unstable();
         self.main_array.dedup();
 
@@ -151,7 +151,9 @@ impl CollatzChecker {
         self.total_checked += (self.min_found - initial_min_found);
     }
 
-    fn process_batch(&mut self, batch: &WorkerBatch) -> BatchResponse {
+    // This method now only handles the 'values_to_check' part of the batch.
+    // 'values_to_add' are returned to the admin thread to be buffered.
+    fn process_check_batch(&self, batch: &WorkerBatch) -> Vec<bool> {
         let mut found_results = Vec::new();
         
         // Quick elimination: if all values in the batch are below the current min_found,
@@ -172,23 +174,7 @@ impl CollatzChecker {
                 }
             }
         }
-        
-        // Add new values (the sequence elements that were not found) to the main array.
-        // This call will now also trigger the powers-of-2 extrapolation and single sort/dedup.
-        if !batch.values_to_add.is_empty() {
-            self.add_values(&batch.values_to_add);
-        }
-        
-        // After potentially adding new values and performing extrapolation, try to advance min_found.
-        // This is crucial for keeping min_found accurate and for purging.
-        self.advance_min_found();
-
-        BatchResponse {
-            worker_id: batch.worker_id,
-            found_results,
-            current_min_found: self.min_found, // Send the updated min_found back to the worker
-            success: true,
-        }
+        found_results
     }
     
     fn get_stats(&self) -> String {
@@ -309,7 +295,7 @@ fn worker_thread(
         if !sequence.is_empty() {
             let batch = WorkerBatch {
                 values_to_check: Vec::new(), // No values to check, just adding
-                values_to_add: sequence,
+                values_to_add: sequence, // This is the sequence to be added to admin's pending buffer
                 worker_id,
             };
             
@@ -354,15 +340,39 @@ fn admin_thread(
     let mut batches_processed = 0;
     let start_time = Instant::now();
     
+    // New: Buffer for values to be added to the main array
+    let mut pending_additions: Vec<u128> = Vec::new();
+
     println!("Admin thread starting...");
     
     // Loop to receive batches from workers until the batch_tx channel is closed (meaning all workers finished).
     while let Ok(batch) = batch_rx.recv() {
-        let response = checker.process_batch(&batch);
+        // Process the 'values_to_check' part immediately
+        let found_results = checker.process_check_batch(&batch);
+        
+        // Accumulate 'values_to_add' into the pending buffer
+        if !batch.values_to_add.is_empty() {
+            pending_additions.extend(batch.values_to_add);
+        }
+
+        // Check if the pending buffer has reached the threshold for batched processing
+        if pending_additions.len() >= ADMIN_ADD_BATCH_THRESHOLD {
+            // Perform the heavy add, extrapolate, sort, dedup, and purge operation
+            checker._add_values_and_extrapolate(&pending_additions);
+            pending_additions.clear(); // Clear the buffer after processing
+            checker.advance_min_found(); // Advance min_found after the batch addition
+        }
         
         // Send the response back to the correct worker based on its ID.
+        // The current_min_found is always the latest from the checker, even if
+        // _add_values_and_extrapolate wasn't just called.
         if let Some(tx) = response_txs.get(batch.worker_id) {
-            if tx.send(response).is_err() {
+            if tx.send(BatchResponse {
+                worker_id: batch.worker_id,
+                found_results,
+                current_min_found: checker.min_found, // Always send the latest min_found
+                success: true,
+            }).is_err() {
                 println!("Admin failed to send response to worker {} (worker channel closed)", batch.worker_id);
             }
         }
@@ -374,9 +384,17 @@ fn admin_thread(
             let elapsed = start_time.elapsed();
             println!("Admin processed {} batches in {:?}", batches_processed, elapsed);
             println!("Stats: {}", checker.get_stats());
+            println!("Pending additions buffer size: {}", pending_additions.len());
         }
     }
     
+    // After all worker batches are received and processed, flush any remaining pending additions.
+    if !pending_additions.is_empty() {
+        println!("Admin flushing final pending additions ({} values)...", pending_additions.len());
+        checker._add_values_and_extrapolate(&pending_additions);
+        checker.advance_min_found(); // Advance min_found one last time
+    }
+
     println!("Admin thread finished. Final stats: {}", checker.get_stats());
     checker // Return the final checker state
 }
@@ -409,6 +427,7 @@ fn main() {
     println!("Starting Collatz Conjecture Checker");
     println!("Configuration: {} workers, batch size {}", WORKER_COUNT, BATCH_SIZE);
     println!("Checking a total range of {} numbers per run.", TOTAL_RANGE_SIZE);
+    println!("Admin will process additions in batches of {} values.", ADMIN_ADD_BATCH_THRESHOLD);
     
     // Try to load previous state, or create a new one
     let initial_checker_state = match load_state() {
@@ -533,8 +552,8 @@ mod tests {
         assert!(!checker.contains_value(3));
         assert!(!checker.contains_value(5));
         
-        // Add some values
-        checker.add_values(&[3, 5, 6]);
+        // Add some values directly (simulating initial setup or a flush)
+        checker._add_values_and_extrapolate(&[3, 5, 6]);
         assert!(checker.contains_value(3));
         assert!(checker.contains_value(5));
         assert!(checker.contains_value(6));
@@ -545,15 +564,12 @@ mod tests {
         
         // Simulate a batch where 5's sequence is resolved (e.g., 5 -> 16 -> 8 -> 4).
         // If 5 is added to main_array, min_found should advance.
-        let batch_for_5 = WorkerBatch {
-            values_to_check: vec![],
-            values_to_add: vec![5, 16, 8], // Assuming these are part of 5's sequence
-            worker_id: 0,
-        };
-        checker.process_batch(&batch_for_5);
+        // We'll use the internal add function for this test.
+        checker._add_values_and_extrapolate(&[5, 16, 8]); // Assuming these are part of 5's sequence
+        checker.advance_min_found(); // Manually advance min_found for test
+        
         // After processing batch for 5, and 5 is added to main_array,
         // min_found should advance past 5.
-        // The advance_min_found function will be called internally by process_batch.
         assert!(checker.min_found > 5, "min_found should have advanced past 5");
         
         // Test purging
@@ -568,7 +584,7 @@ mod tests {
         cleanup_test_file(); // Ensure no old file interferes
 
         let mut original_checker = CollatzChecker::new();
-        original_checker.add_values(&[7, 10, 20]);
+        original_checker._add_values_and_extrapolate(&[7, 10, 20]);
         original_checker.advance_min_found(); // Advance min_found after adding
         original_checker.min_found = 10; // Manually set for test
         original_checker.total_checked = 5;
@@ -595,14 +611,8 @@ mod tests {
         let initial_max_stored = checker.max_stored;
 
         // Add a new value, say 3, which is known to converge (3 -> 10 -> 5 -> 16 -> 8 -> 4 -> 2 -> 1)
-        // Its sequence contains 5, 8, 10, 16, etc.
-        // We expect powers of 2 for 3, 5, 8, 10, 16 etc. to be extrapolated.
-        checker.add_values(&[3]); 
-        
-        // After adding 3, and its sequence (which includes 5, 8, 10, 16 etc. from CollatzChecker::new() and its path),
-        // we expect multiples of 2 to be added.
-        // For example, if 3 is added, 6, 12, 24... should be extrapolated.
-        // If 5 is added (which it is, indirectly via 3's path), 10, 20, 40... should be extrapolated.
+        // We use the internal _add_values_and_extrapolate directly for this test.
+        checker._add_values_and_extrapolate(&[3]); 
         
         // Assert that some extrapolated values are present
         assert!(checker.contains_value(6), "6 (3*2) should be extrapolated");
@@ -616,9 +626,8 @@ mod tests {
         assert!(checker.max_stored > initial_max_stored, "Max stored should increase due to extrapolation");
 
         // Test with a value that is already a power of 2, like 8 (already in array)
-        // Extrapolating 8 should add 16, 32, 64, etc.
         let old_len = checker.main_array.len();
-        checker.add_values(&[8]); // 8 is already in the array from 3's sequence
+        checker._add_values_and_extrapolate(&[8]); // 8 is already in the array from 3's sequence
         assert_eq!(checker.main_array.len(), old_len, "Adding 8 should not change length if already present");
         assert!(checker.contains_value(64), "64 (8*8) should be extrapolated if 8 was processed");
         assert!(checker.contains_value(128), "128 (64*2) should be extrapolated");
